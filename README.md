@@ -320,7 +320,6 @@ VITE_WALLET_CONNECT_PROJECT_ID=<your-project-id>
 
 ## 📖 Documentation
 
-- **Deployment Guide**: [DEPLOYMENT.md](./DEPLOYMENT.md)
 - **Zama Docs**: https://docs.zama.ai/
 - **fhEVM Guide**: https://docs.zama.ai/protocol
 - **Wagmi Docs**: https://wagmi.sh/
@@ -374,12 +373,3 @@ BSD-3-Clause-Clear License
 
 *For questions or support, open an issue on GitHub.*
 
-## Additional Documentation
-- [Setup Guide](SETUP.md)
-- [API Reference](API.md)
-- [Testing Guide](TESTING.md)
-- [Security](SECURITY.md)
-- [Troubleshooting](TROUBLESHOOTING.md)
-- [Roadmap](ROADMAP.md)
-- [FAQ](FAQ.md)
-- [Contributing](CONTRIBUTING.md)

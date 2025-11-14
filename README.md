@@ -373,3 +373,13 @@ BSD-3-Clause-Clear License
 **Built with ❤️ using Zama fhEVM**
 
 *For questions or support, open an issue on GitHub.*
+
+## Additional Documentation
+- [Setup Guide](SETUP.md)
+- [API Reference](API.md)
+- [Testing Guide](TESTING.md)
+- [Security](SECURITY.md)
+- [Troubleshooting](TROUBLESHOOTING.md)
+- [Roadmap](ROADMAP.md)
+- [FAQ](FAQ.md)
+- [Contributing](CONTRIBUTING.md)

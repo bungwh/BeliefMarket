@@ -1,0 +1,364 @@
+// SPDX-License-Identifier: BSD-3-Clause-Clear
+pragma solidity ^0.8.24;
+
+import { FHE, euint64, externalEuint64 } from "@fhevm/solidity/lib/FHE.sol";
+import { SepoliaConfig } from "@fhevm/solidity/config/ZamaConfig.sol";
+
+/**
+ * @title BeliefMarket (FHE-enabled)
+ * @notice 市场创建信息使用明文，用户投票（权重）通过 FHE 加密，揭晓阶段才解密票数。
+ */
+contract BeliefMarket is SepoliaConfig {
+    struct BetInfo {
+        string title;
+        string description;
+        address creator;
+        uint256 platformStake;
+        uint256 voteStake;
+        uint256 expiryTime;
+        bool isResolved;
+        euint64 yesVotes;
+        euint64 noVotes;
+        uint64 revealedYes;
+        uint64 revealedNo;
+        uint256 prizePool;
+        bool yesWon;
+        uint256 decryptionRequestId;
+        bool revealPending;
+    }
+
+    uint256 public platformStake = 0.001 ether;
+    uint256 public constant MIN_VOTE_STAKE = 0.005 ether;
+    uint256 public constant MIN_DURATION = 5 minutes;
+    uint256 public constant MAX_DURATION = 30 days;
+
+    mapping(string => BetInfo) private bets;
+    mapping(string => mapping(address => bool)) public hasVoted;
+    mapping(string => mapping(address => uint8)) internal userVoteType;
+    mapping(string => mapping(address => bool)) internal hasClaimed;
+    mapping(string => bool) public callbackHasBeenCalled;
+    mapping(uint256 => string) internal betIdByRequestId;
+    string[] private allBetIds;
+
+    uint256 public platformFees;
+    address public owner;
+    bool public isTesting;
+
+    event BetCreated(
+        string indexed betId,
+        address indexed creator,
+        string title,
+        uint256 voteStake,
+        uint256 expiryTime
+    );
+    event VoteCast(string indexed betId, address indexed voter, uint8 voteType);
+    event TallyRevealRequested(string indexed betId, uint256 requestId);
+    event BetResolved(
+        string indexed betId,
+        bool yesWon,
+        uint64 revealedYes,
+        uint64 revealedNo,
+        uint256 totalPrize
+    );
+    event PrizeDistributed(string indexed betId, address indexed winner, uint256 amount);
+    event PlatformFeesWithdrawn(address indexed to, uint256 amount);
+
+    error RevealAlreadyPending();
+    error RevealNotPending();
+    error InvalidVoteStake();
+    error InvalidVoteType();
+    error InvalidRevealRequest();
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    constructor() {
+        owner = msg.sender;
+    }
+
+    // ==== Admin Controls ====
+
+    function setReplicaTesting(bool enabled) external onlyOwner {
+        isTesting = enabled;
+    }
+
+    function setReplicaPlatformStake(uint256 newStake) external onlyOwner {
+        require(newStake > 0, "Stake must be positive");
+        platformStake = newStake;
+    }
+
+    function withdrawReplicaPlatformFees(address to) external onlyOwner {
+        require(platformFees > 0, "No fees");
+        uint256 amount = platformFees;
+        platformFees = 0;
+        (bool sent, ) = payable(to).call{value: amount}("");
+        require(sent, "Withdraw failed");
+        emit PlatformFeesWithdrawn(to, amount);
+    }
+
+    // ==== Core Logic ====
+
+    function createReplicaBet(
+        string memory betId,
+        string memory title,
+        string memory description,
+        uint256 voteStake,
+        uint256 duration
+    ) external payable {
+        require(bytes(betId).length > 0, "Bet id required");
+        require(bytes(title).length > 0, "Title required");
+        require(msg.value == platformStake, "Stake platform fee");
+        require(voteStake >= MIN_VOTE_STAKE, "Vote stake low");
+        require(duration >= MIN_DURATION && duration <= MAX_DURATION, "Invalid duration");
+
+        platformFees += msg.value;
+
+        BetInfo storage bet = bets[betId];
+        require(bet.creator == address(0), "Bet exists");
+
+        bet.title = title;
+        bet.description = description;
+        bet.creator = msg.sender;
+        bet.platformStake = msg.value;
+        bet.voteStake = voteStake;
+        bet.expiryTime = block.timestamp + duration;
+        bet.yesVotes = FHE.asEuint64(0);
+        bet.noVotes = FHE.asEuint64(0);
+
+        FHE.allowThis(bet.yesVotes);
+        FHE.allowThis(bet.noVotes);
+
+        allBetIds.push(betId);
+        emit BetCreated(betId, msg.sender, title, voteStake, bet.expiryTime);
+    }
+
+    function castReplicaVote(
+        string memory betId,
+        uint8 voteType,
+        externalEuint64 encryptedWeight,
+        bytes calldata inputProof
+    ) external payable {
+        BetInfo storage bet = bets[betId];
+        require(bet.creator != address(0), "Bet missing");
+        require(!bet.isResolved, "Settled");
+        require(block.timestamp < bet.expiryTime, "Expired");
+        require(msg.value == bet.voteStake, "Stake mismatch");
+        require(!hasVoted[betId][msg.sender], "Already voted");
+        if (voteType > 1) revert InvalidVoteType();
+
+        euint64 weight = FHE.fromExternal(encryptedWeight, inputProof);
+        FHE.allow(weight, msg.sender);
+
+        if (voteType == 1) {
+            bet.yesVotes = FHE.add(bet.yesVotes, weight);
+        } else {
+            bet.noVotes = FHE.add(bet.noVotes, weight);
+        }
+
+        FHE.allowThis(bet.yesVotes);
+        FHE.allowThis(bet.noVotes);
+
+        hasVoted[betId][msg.sender] = true;
+        userVoteType[betId][msg.sender] = voteType;
+        bet.prizePool += msg.value;
+
+        emit VoteCast(betId, msg.sender, voteType);
+    }
+
+    function requestReplicaTallyReveal(string memory betId) external {
+        BetInfo storage bet = bets[betId];
+        require(bet.creator != address(0), "Bet missing");
+        require(block.timestamp >= bet.expiryTime, "Not expired");
+        require(!bet.isResolved, "Settled");
+        require(msg.sender == bet.creator, "Only creator");
+        if (bet.revealPending) revert RevealAlreadyPending();
+
+        bytes32[] memory cts = new bytes32[](2);
+        cts[0] = FHE.toBytes32(bet.yesVotes);
+        cts[1] = FHE.toBytes32(bet.noVotes);
+
+        uint256 requestId = FHE.requestDecryption(cts, this.resolveReplicaTallyCallback.selector);
+        bet.decryptionRequestId = requestId;
+        bet.revealPending = true;
+        betIdByRequestId[requestId] = betId;
+
+        emit TallyRevealRequested(betId, requestId);
+    }
+
+    function resolveReplicaTallyCallback(
+        uint256 requestId,
+        bytes memory cleartexts,
+        bytes memory decryptionProof
+    ) external {
+        string memory betId = betIdByRequestId[requestId];
+        if (bytes(betId).length == 0) revert InvalidRevealRequest();
+        BetInfo storage bet = bets[betId];
+        if (!bet.revealPending) revert RevealNotPending();
+
+        FHE.checkSignatures(requestId, cleartexts, decryptionProof);
+        (uint64 revealedYes, uint64 revealedNo) = abi.decode(cleartexts, (uint64, uint64));
+
+        bet.revealedYes = revealedYes;
+        bet.revealedNo = revealedNo;
+        bet.yesWon = revealedYes > revealedNo;
+        bet.isResolved = true;
+        bet.revealPending = false;
+        callbackHasBeenCalled[betId] = true;
+        delete betIdByRequestId[requestId];
+
+        emit BetResolved(betId, bet.yesWon, revealedYes, revealedNo, bet.prizePool);
+    }
+
+    function claimReplicaPrize(string memory betId) external {
+        BetInfo storage bet = bets[betId];
+        require(bet.isResolved, "Not resolved");
+        require(!bet.revealPending, "Reveal pending");
+        require(bet.revealedYes != bet.revealedNo, "Tie");
+        require(hasVoted[betId][msg.sender], "Did not vote");
+        require(!hasClaimed[betId][msg.sender], "Claimed");
+
+        bool isWinner = (bet.yesWon && userVoteType[betId][msg.sender] == 1) ||
+            (!bet.yesWon && userVoteType[betId][msg.sender] == 0);
+        require(isWinner, "Not winner");
+
+        uint256 userWeight = bet.voteStake;
+        uint256 totalWinningWeight = bet.yesWon ? bet.revealedYes : bet.revealedNo;
+        require(totalWinningWeight > 0, "No winners");
+
+        hasClaimed[betId][msg.sender] = true;
+        uint256 prize = (bet.prizePool * userWeight) / totalWinningWeight;
+        (bool sent, ) = payable(msg.sender).call{value: prize}("");
+        require(sent, "Transfer failed");
+
+        emit PrizeDistributed(betId, msg.sender, prize);
+    }
+
+    function claimReplicaRefund(string memory betId) external {
+        BetInfo storage bet = bets[betId];
+        require(bet.isResolved, "Not resolved");
+        require(!bet.revealPending, "Reveal pending");
+        require(bet.revealedYes == bet.revealedNo, "Not tie");
+        require(hasVoted[betId][msg.sender], "Did not vote");
+        require(!hasClaimed[betId][msg.sender], "Claimed");
+
+        hasClaimed[betId][msg.sender] = true;
+        (bool sent, ) = payable(msg.sender).call{value: bet.voteStake}("");
+        require(sent, "Refund failed");
+    }
+
+    // ==== View Helpers ====
+
+    function getReplicaBet(string memory betId)
+        external
+        view
+        returns (
+            string memory title,
+            string memory description,
+            address creator,
+            uint256 platformStakeValue,
+            uint256 voteStake,
+            uint256 expiryTime,
+            bool isResolved,
+            uint64 revealedYes,
+            uint64 revealedNo,
+            uint256 prizePool,
+            bool yesWon,
+            bool revealPending
+        )
+    {
+        BetInfo storage bet = bets[betId];
+        require(bet.creator != address(0), "Bet missing");
+        return (
+            bet.title,
+            bet.description,
+            bet.creator,
+            bet.platformStake,
+            bet.voteStake,
+            bet.expiryTime,
+            bet.isResolved,
+            bet.revealedYes,
+            bet.revealedNo,
+            bet.prizePool,
+            bet.yesWon,
+            bet.revealPending
+        );
+    }
+
+    function getReplicaDecryptionRequestId(string memory betId) external view returns (uint256) {
+        return bets[betId].decryptionRequestId;
+    }
+
+    function getReplicaRevealStatus(string memory betId)
+        external
+        view
+        returns (
+            bool isResolved,
+            bool pending,
+            uint64 revealedYes,
+            uint64 revealedNo,
+            uint256 decryptionRequestId
+        )
+    {
+        BetInfo storage bet = bets[betId];
+        return (
+            bet.isResolved,
+            bet.revealPending,
+            bet.revealedYes,
+            bet.revealedNo,
+            bet.decryptionRequestId
+        );
+    }
+
+    function hasReplicaUserClaimed(string memory betId, address user) external view returns (bool) {
+        return hasClaimed[betId][user];
+    }
+
+    function hasReplicaUserVoted(string memory betId, address user) external view returns (bool) {
+        return hasVoted[betId][user];
+    }
+
+    function getReplicaUserVoteType(string memory betId, address user)
+        external
+        view
+        returns (bool exists, uint8 voteType, bool claimed)
+    {
+        bool voted = hasVoted[betId][user];
+        return (voted, voted ? userVoteType[betId][user] : 0, hasClaimed[betId][user]);
+    }
+
+    function getReplicaBetIds() external view returns (string[] memory) {
+        return allBetIds;
+    }
+
+    // ==== Testing Helpers ====
+
+    function replicaTestingMarkVoted(string memory betId, address voter, uint8 voteType) external onlyOwner {
+        require(isTesting, "Testing disabled");
+        BetInfo storage bet = bets[betId];
+        require(bet.creator != address(0), "Bet missing");
+        hasVoted[betId][voter] = true;
+        userVoteType[betId][voter] = voteType;
+    }
+
+    function replicaTestingFundPrizePool(string memory betId) external payable onlyOwner {
+        require(isTesting, "Testing disabled");
+        BetInfo storage bet = bets[betId];
+        require(bet.creator != address(0), "Bet missing");
+        bet.prizePool += msg.value;
+    }
+
+    function replicaTestingResolve(string memory betId, uint64 revealedYes, uint64 revealedNo) external onlyOwner {
+        require(isTesting, "Testing disabled");
+        BetInfo storage bet = bets[betId];
+        require(bet.creator != address(0), "Bet missing");
+        bet.revealedYes = revealedYes;
+        bet.revealedNo = revealedNo;
+        bet.yesWon = revealedYes > revealedNo;
+        bet.isResolved = true;
+        bet.revealPending = false;
+    }
+
+    receive() external payable {}
+}
